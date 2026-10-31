@@ -3,6 +3,7 @@
 import os
 import threading
 import time
+import uuid
 import pytest
 
 pty = pytest.importorskip("pty")
@@ -48,6 +49,8 @@ class Rig:
         self.threads = []
         try:
             self.dev = Nonin(port=self.path, protocol=fmt, timeout=0.3)
+            # Isolate repeated LSL discovery from earlier emulated devices.
+            self.dev.serial_number = "pty-" + uuid.uuid4().hex
         except BaseException:
             os.close(self.master)
             os.close(self.slave)
