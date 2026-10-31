@@ -1,21 +1,21 @@
-SHELL := /bin/bash #to be able to execute `source`
+SHELL := /bin/bash
+PYTHON ?= python
+TEST_ENV ?= .test
+TEST_PYTHON = $(abspath $(TEST_ENV))/bin/python
 
-.PHONY: build clean test upload docs
+.PHONY: build clean test upload
 build: clean
-	python setup.py  sdist bdist_wheel
+	$(PYTHON) -m build
 
 clean:
-	rm -rf dist */*.egg-info *.egg-info  build
-	rm -rf .test
+	rm -rf dist *.egg-info build
 
 test: build
-	twine check dist/*
-	# twine upload --repository-url https://test.pypi.org/legacy/ dist/* --verbose
-	virtualenv .test
-	source .test/bin/activate
-	pip install dist/*.whl
-	pytest
+	$(PYTHON) -m twine check dist/*
+	$(PYTHON) -m virtualenv --copies $(TEST_ENV)
+	$(TEST_PYTHON) -m pip install dist/*.whl pytest pytest-cov
+	cd $(TEST_ENV) && $(TEST_PYTHON) -m pytest -c $(CURDIR)/pytest.ini $(CURDIR)/tests
 
 upload: build
-	twine check dist/*
-	twine upload dist/* --verbose
+	$(PYTHON) -m twine check dist/*
+	$(PYTHON) -m twine upload dist/*

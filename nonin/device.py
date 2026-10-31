@@ -1,141 +1,149 @@
-from serial import Serial
-from serial.tools.list_ports import comports, grep
-from typing import Dict
-from pylsl import local_clock
+"""Serial interface for Nonin format 2 and format 7 devices."""
+
+import logging
+import os
 import time
+from collections import deque
+from typing import Dict
+
+from pylsl import local_clock
+from serial import Serial, SerialException
+from serial.tools.list_ports import comports
+
+from .protocol import StreamDecoder
+
+log = logging.getLogger(__name__)
 
 
 def detect_nonin_devices():
-    """
-    Detects all nonin devices connected to the computer.
-
-    returns
-    -------
-    devices : list
-        a list of ports that are Nonin Medical Pulse Oximeters
-    """
-    devices = []
-    for port in comports():
-        if port.vid == 1027 and port.pid == 24577:
-            port.manufacturer = "Nonin Medical"
-            port.product = "Pulse Oximeter"
-            devices.append(port)
-    if len(devices) == 0:
-        raise ConnectionError("No Nonin Medical Pulse Oximeter found")
-
+    """Find candidate USB serial ports; USB identifiers do not identify a model."""
+    devices = [p for p in comports() if p.vid == 1027 and p.pid == 24577]
+    if not devices:
+        raise ConnectionError("No Nonin candidate serial ports found")
     return devices
 
 
 def validate_port(port: str = None):
-    valid_devices = detect_nonin_devices()
     if port is None:
-        device = valid_devices[0]
-        port = device.device
-        print(
-            f"Automatically chose {port} as it is a {device.manufacturer} {device.product}"
-        )
-    else:
-        for d in valid_devices:
-            if d.device == port:
-                device = d
-                port = device.device
-                print(
-                    f"Confirmed {port} is {device.manufacturer} {device.product}"
-                )
-                break
-        else:
-            raise ConnectionError("No Nonin Medical Pulse Oximeter found")
-    time.sleep(1)
+        device = detect_nonin_devices()[0]
+        return device.device, device
+    device = next(
+        (p for p in comports() if os.path.realpath(p.device) == os.path.realpath(port)),
+        None,
+    )
+    if device is None and not os.path.exists(port):
+        raise ConnectionError(f"Serial port not found: {port}")
     return port, device
 
 
 class Nonin:
-    "Object resembling the Nonin 3012 LP USB for data handling"
+    """A configured Nonin device. Reconnect requires a manual restart."""
 
-    def __init__(self, port: str = None, baudrate=9600, protocol=2):
-        port, device = validate_port(port)
-        self.port = port
-        self.manufacturer = device.manufacturer
-        self.product = device.product
-        self.serial_number = device.serial_number
-        print("Found", self)
-        if protocol is not 2:
-            raise NotImplementedError("Only protocol 2 is supported")
-        self.serial = Serial(port, baudrate)
+    def __init__(self, port: str = None, baudrate=9600, protocol=2, timeout=1.0):
+        if protocol not in (2, 7):
+            raise ValueError("protocol must be 2 or 7")
+        if timeout is None or timeout <= 0:
+            raise ValueError("timeout must be positive and finite")
+        import math
+
+        if not math.isfinite(timeout):
+            raise ValueError("timeout must be positive and finite")
+        self.port, device = validate_port(port)
+        self.protocol = protocol
+        self.model = "3012LP" if protocol == 2 else "3017LP"
+        self.manufacturer = getattr(device, "manufacturer", None) or "Nonin Medical"
+        self.product = getattr(device, "product", None) or "Pulse Oximeter"
+        self.serial_number = getattr(device, "serial_number", None) or "unknown"
+        self.timeout = timeout
         self.packet_count = 0
         self.frame_count = 0
-        self.serial.flush()
+        self.last_timestamp = None
+        self.decoder = StreamDecoder(protocol)
+        self._pending = deque()
+        self._closed = False
+        try:
+            self.serial = Serial(self.port, baudrate, timeout=timeout)
+        except (SerialException, OSError) as exc:
+            raise ConnectionError(f"Unable to open serial port {self.port}") from exc
 
     def read_frame(self):
-        "Reads the next data packet from the device"
-        frame = self.serial.read_until(b"\x01")
-        while len(frame) < 5:
-            frame = frame + self.serial.read_until(b"\x01")
+        """Return the next validated canonical five-byte frame."""
+        if self._closed:
+            raise ConnectionError("Serial port is closed; restart the device")
+        deadline = time.monotonic() + self.timeout
+        while not self._pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.decoder.reset()
+                raise TimeoutError("No complete validated sample before timeout")
+            try:
+                self.serial.timeout = remaining
+                size = min(256, max(1, self.serial.in_waiting))
+                data = self.serial.read(size)
+                timestamp = local_clock()
+            except (SerialException, OSError) as exc:
+                log.error("Serial device disconnected: %s", exc)
+                raise ConnectionError(
+                    "Serial device disconnected; restart required"
+                ) from exc
+            if not data:
+                self.decoder.reset()
+                raise TimeoutError("No complete validated sample before timeout")
+            frames = self.decoder.feed(data, timestamp)
+            if len(frames) > 1:
+                log.info("Buffered burst of %d validated frames", len(frames))
+            self._pending.extend(frames)
+        frame, self.last_timestamp = self._pending.popleft()
         self.frame_count += 1
-        return frame[-5:]
+        status = frame[1 if self.protocol == 2 else 0]
+        if status & 1:
+            self.packet_count += 1
+        return frame
 
     def read(self) -> Dict[str, int]:
         frame = self.read_frame()
-        status, pleth, other, chksum, start = frame
-        status = self.parse_status(status)
-        if status["Frame Sync"] == 1:
-            self.packet_count += 1
-            # print(f"Packet #{self.packet_count:10.0f}")
-            self.frame_count = 0
-        pleth = self.parse_pleth(pleth)
-        return {
-            **pleth,
-            **status,
-        }
+        if self.protocol == 2:
+            status, pleth = frame[1], frame[2]
+        else:
+            status, pleth = frame[0], (frame[1] << 8) | frame[2]
+        return {**self.parse_pleth(pleth), **self.parse_status(status)}
 
     @staticmethod
     def parse_status(status: int) -> Dict[str, int]:
-        "Returns a tuple of status flags"
-        # packet starts when sync byte is 0x01
-        sync = (status >> 0) & 1
-        # Perfusion score
-        gprf = (status >> 1) & 1
-        rprf = (status >> 1) & 2
-        perfscore = 0
-        if rprf:
-            perfscore = 1
-        if gprf:
-            perfscore = 3
-        if rprf and gprf:
-            perfscore = 2
-        # print(rprf, gprf, perfscore)
-        # sensor alarm
-        snsa = (status >> 3) & 1
-        oot = (status >> 4) & 1
-        artf = (status >> 5) & 1
-        snsd = (status >> 6) & 1
-        # always set
-        if ((status >> 7) & 1) != 1:
-            print(ValueError("Status bit 7 is not set"))
-
+        red, green = bool(status & 4), bool(status & 2)
+        perfusion = {
+            (False, False): 0,
+            (True, False): 1,
+            (True, True): 2,
+            (False, True): 3,
+        }[(red, green)]
         return {
-            "Frame Sync": sync,
-            "Perfusion Amplitude": perfscore,
-            "Sensor Alarm": snsa,
-            "Out Of Track": oot,
-            "Artifact - short term": artf,
-            "Sensor disconnect": snsd,
+            "Frame Sync": status & 1,
+            "Perfusion Amplitude": perfusion,
+            "Sensor Alarm": (status >> 3) & 1,
+            "Out Of Track": (status >> 4) & 1,
+            "Artifact - short term": (status >> 5) & 1,
+            "Sensor disconnect": (status >> 6) & 1,
         }
 
     @staticmethod
     def parse_pleth(pleth: int) -> Dict[str, int]:
         return {"PPG": pleth}
 
-    def __str__(self) -> str:
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self.serial.close()
+            log.info(
+                "Serial session ended: frames=%d packets=%d discarded_bytes=%d rejected_aligned_frames=%d checksum_errors_aligned=%d resets=%d acquisitions=%d",
+                self.frame_count,
+                self.packet_count,
+                self.decoder.discarded_bytes,
+                self.decoder.rejected_frames,
+                self.decoder.checksum_errors_aligned,
+                self.decoder.resets,
+                self.decoder.acquisitions,
+            )
+
+    def __str__(self):
         return f"{self.manufacturer} {self.product} {self.serial_number} at {self.port}"
-
-
-if __name__ == "__main__":
-    # nonin = Nonin("/dev/ttyUSB0")
-    nonin = Nonin(port=None)
-    t0 = local_clock()
-    while True:
-        data = nonin.read()
-        td = local_clock() - t0
-        if nonin.frame_count == 0:
-            print(f"Fs = {1/(td / (25 * nonin.packet_count)):3.3f}Hz")

@@ -12,3 +12,7 @@ htmlcov/*
 docs/build/*
 docs/source/_autosummary/*
 *.xdf
+
+.pytest_cache/
+.venv/
+.coverage.*

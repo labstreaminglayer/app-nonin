@@ -9,7 +9,7 @@ with (Path(__file__).parent / "requirements.txt").open() as f:
 
 setup(
     name="nonin",
-    version="0.2.4",
+    version="0.3.0",
     description="Publish data from a Nonin PPG as LSL Outlet",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -21,7 +21,9 @@ setup(
     install_requires=install_requires,
     download_url="https://github.com/agricolab/app-nonin",
     license="MIT",
-    entry_points={"console_scripts": ["nonin-lsl=nonin.__main__:main"],},
+    entry_points={
+        "console_scripts": ["nonin-lsl=nonin.__main__:main"],
+    },
     classifiers=[
         "Development Status :: 5 - Production/Stable",
         "Environment :: Console",

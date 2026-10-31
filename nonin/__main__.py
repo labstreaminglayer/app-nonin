@@ -25,9 +25,17 @@ def run(port=None, protocol=2) -> Outlet:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Stream a Nonin pulse oximeter to LSL")
-    parser.add_argument("--scan", action="store_true", help="report the available devices")
+    parser.add_argument(
+        "--scan", action="store_true", help="report the available devices"
+    )
     parser.add_argument("--port", default=None, help="which port to use")
-    parser.add_argument("--format", type=int, choices=(2, 7), default=2, help="device data format (default: 2)")
+    parser.add_argument(
+        "--format",
+        type=int,
+        choices=(2, 7),
+        default=2,
+        help="device data format (default: 2)",
+    )
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     try:
