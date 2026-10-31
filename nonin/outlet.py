@@ -1,69 +1,79 @@
-from pylsl import StreamOutlet, local_clock, StreamInfo
-from socket import gethostname
+"""Publish validated Nonin samples to Lab Streaming Layer."""
+import logging
 import threading
+import time
+from socket import gethostname
+
+from pylsl import StreamInfo, StreamOutlet
+
+
+logger = logging.getLogger(__name__)
+CHANNELS = (
+    "PPG", "Frame Sync", "Perfusion Amplitude", "Sensor Alarm", "Out Of Track",
+    "Artifact - short term", "Sensor disconnect",
+)
 
 
 def create_stream_outlet(nonin):
     info = StreamInfo(
-        name="Nonin Medical Pulse Oximeter",
-        type="PPG",
-        channel_count=7,
-        nominal_srate=75,
-        channel_format="float32",
-        source_id=f"Nonin_3012_LP_USB_{nonin.serial_number}_{str(gethostname())}",
+        name="Nonin Medical Pulse Oximeter", type="PPG", channel_count=7,
+        nominal_srate=75, channel_format="float32",
+        source_id=f"Nonin_{nonin.model[:4]}_LP_USB_{nonin.serial_number}_{gethostname()}",
     )
-
-    names = [
-        "PPG",
-        "Frame Sync",
-        "Perfusion Amplitude",
-        "Sensor Alarm",
-        "Out Of Track",
-        "Artifact - short term",
-        "Sensor disconnect",
-    ]
-    units = ["au"] * len(names)
-    types = ["PPG"] + ["STATE"] * (len(names) - 1)
-
-    channels = info.desc().append_child("channels")
-    for c, u, t in zip(names, units, types):
-        channels.append_child("channel").append_child_value(
-            "label", c
-        ).append_child_value("unit", u).append_child_value("type", t)
-    stream = StreamOutlet(info, chunk_size=0, max_buffered=1)
-    print("Creating", info.as_xml())
-    return stream
+    desc = info.desc()
+    desc.append_child_value("selected_model", nonin.model)
+    desc.append_child_value("data_format", str(nonin.protocol))
+    desc.append_child_value("model_identity", "Selected configuration; not detected hardware identity")
+    desc.append_child_value("sample_representation", "Raw unsigned 16-bit PPG" if nonin.protocol == 7 else "Raw unsigned 8-bit PPG")
+    desc.append_child_value("timestamp_policy", "Host LSL clock at completion of serial read; buffered frames may share a timestamp; not sensor acquisition time")
+    desc.append_child_value("quality_flags", "Status flags report device sensor and signal conditions")
+    desc.append_child_value("sequence_counter", "None; sample loss cannot be fully detected")
+    channels = desc.append_child("channels")
+    for index, name in enumerate(CHANNELS):
+        channels.append_child("channel").append_child_value("label", name).append_child_value(
+            "unit", "au"
+        ).append_child_value("type", "PPG" if index == 0 else "STATE")
+    logger.info("Creating LSL stream: %s", info.as_xml())
+    return StreamOutlet(info, chunk_size=0, max_buffered=1)
 
 
 class Outlet(threading.Thread):
+    """Publish until stopped or a device/LSL error occurs; inspect ``error`` after joining."""
+
     def __init__(self, nonin):
-        threading.Thread.__init__(self)
+        super().__init__()
         self.nonin = nonin
+        self.error = None
+        self._stop_requested = threading.Event()
+
+    def stop(self):
+        self._stop_requested.set()
+        self.nonin.close()
 
     def run(self):
-        self.is_running = True
-        nonin = self.nonin
-        stream = create_stream_outlet(nonin)
-
-        t0 = None
-
-        def print_log(t0, data, dt=[], cnt=[0]):
-            t1 = local_clock()
-            if t0 is not None:
-                cnt[0] += 1
-                dt.append(t1 - t0)
-                if len(dt) > 100:
-                    dt = dt[-100:]
-                Fs = len(dt) / sum(dt)
-                if data["Frame Sync"] == 1:
-                    ppg = data["PPG"]
-                    print(
-                        f"Packet #{nonin.packet_count:5.0f} example frame #{int(cnt[0]):5} with {ppg:3.0f} at {t1:4.2f} Fs ~ {Fs:4.2f}"
-                    )
-            return t1
-
-        while self.is_running:  # publish
-            data = nonin.read()
-            t0 = print_log(t0, data)
-            stream.push_sample(list(data.values()))
-
+        last_timeout_log = 0.0
+        try:
+            stream = create_stream_outlet(self.nonin)
+            while not self._stop_requested.is_set():
+                try:
+                    data = self.nonin.read()
+                except TimeoutError:
+                    now = time.monotonic()
+                    if now - last_timeout_log >= 10:
+                        logger.warning("No valid samples received; packets=%s frames=%s", self.nonin.packet_count, self.nonin.frame_count)
+                        last_timeout_log = now
+                    continue
+                stream.push_sample([data[name] for name in CHANNELS], timestamp=self.nonin.last_timestamp)
+                if data["Frame Sync"]:
+                    logger.info("Packets=%s frames=%s PPG=%s", self.nonin.packet_count, self.nonin.frame_count, data["PPG"])
+        except Exception as exc:
+            if not self._stop_requested.is_set():
+                self.error = exc
+                logger.exception("Outlet stopped after an error; restart manually after reconnecting the device")
+        finally:
+            try:
+                self.nonin.close()
+            except Exception as exc:
+                if self.error is None:
+                    self.error = exc
+                logger.exception("Failed to close the device")
