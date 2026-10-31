@@ -119,7 +119,13 @@ def plot_stream(samples, timestamps, output):
     axes[2].step(elapsed, samples[:, 2], where="post")
     axes[2].set_yticks([0, 1, 2, 3], ["none", "poor", "marginal", "high"])
     axes[2].set_ylabel("Perfusion category")
-    axes[3].plot(elapsed[1:], np.diff(timestamps), ".", markersize=3)
+    intervals = np.diff(timestamps)
+    axes[3].plot(elapsed[1:], intervals, ".", markersize=3)
+    if len(intervals):
+        low, high = min(0.0, float(intervals.min())), max(0.0, float(intervals.max()))
+        margin = max(high - low, 0.001) * 0.05
+        axes[3].set_ylim(low - margin, high + margin)
+    axes[3].ticklabel_format(axis="y", useOffset=False, style="plain")
     axes[3].set_ylabel("Receive interval (s)")
     axes[3].set_xlabel("Receive time since first recorded sample (s)")
     for axis in axes:
